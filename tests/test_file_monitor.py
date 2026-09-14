@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from ebabf.collectors.filesystem import (
     FileMonitorCollector,
     WatchRoot,
     _BufferingHandler,
+    _KNOWN_NON_MUTATION_EVENTS,
     classify_sensitive,
     default_watch_roots,
     read_inotify_limit,
@@ -244,3 +246,134 @@ class TestDefaultRoots:
         home = tmp_path / "home"
         (home / "bob" / "Documents").mkdir(parents=True)
         assert any(r.label == "bob:Documents" for r in default_watch_roots(home_parent=home))
+
+
+class TestOnlyMutationsAreCounted:
+    """Regression: reads were being counted as modifications.
+
+    watchdog emits `opened`, `closed` and `closed_no_write` alongside the four
+    mutation types. The handler used to fold every unrecognised type into
+    `modified`, so reading 20 files registered as 40 modifications - a backup
+    job or a recursive grep looked exactly like mass encryption.
+    """
+
+    def test_reads_are_not_modifications(self, tmp_path: Path) -> None:
+        handler = _BufferingHandler(WatchRoot(tmp_path, "docs", "alice"))
+        for index in range(20):
+            handler.record("opened", f"/home/alice/Documents/f{index}.txt")
+            handler.record("closed_no_write", f"/home/alice/Documents/f{index}.txt")
+
+        activity = handler.drain()
+        assert activity.total == 0, "reading files must not register as modification"
+        assert activity.modified == 0
+        assert activity.distinct_paths == set()
+        assert activity.ignored == 40
+
+    def test_closing_after_a_write_is_not_a_second_modification(
+        self, tmp_path: Path
+    ) -> None:
+        handler = _BufferingHandler(WatchRoot(tmp_path, "docs", "alice"))
+        for event_type in ("created", "opened", "modified", "closed"):
+            handler.record(event_type, "/home/alice/Documents/a.txt")
+
+        activity = handler.drain()
+        assert (activity.created, activity.modified) == (1, 1)
+        assert activity.total == 2
+        assert activity.ignored == 2
+
+    def test_mutation_types_come_from_watchdog_not_from_memory(self) -> None:
+        from watchdog.events import (
+            EVENT_TYPE_CREATED,
+            EVENT_TYPE_DELETED,
+            EVENT_TYPE_MODIFIED,
+            EVENT_TYPE_MOVED,
+        )
+
+        from ebabf.collectors.filesystem import MUTATION_EVENTS
+
+        assert set(MUTATION_EVENTS) == {
+            EVENT_TYPE_CREATED,
+            EVENT_TYPE_DELETED,
+            EVENT_TYPE_MODIFIED,
+            EVENT_TYPE_MOVED,
+        }
+
+    def test_no_current_watchdog_event_type_is_unhandled(self) -> None:
+        """Every type this watchdog can emit is either a mutation or known."""
+        import watchdog.events as events
+
+        from ebabf.collectors.filesystem import (
+            _KNOWN_NON_MUTATION_EVENTS,
+            MUTATION_EVENTS,
+        )
+
+        emitted = {
+            getattr(events, name)
+            for name in dir(events)
+            if name.startswith("EVENT_TYPE_")
+        }
+        unaccounted = emitted - set(MUTATION_EVENTS) - _KNOWN_NON_MUTATION_EVENTS
+        assert unaccounted == set(), (
+            f"watchdog can emit {sorted(unaccounted)}, which this collector "
+            "classifies neither as a mutation nor as a known non-mutation"
+        )
+
+    def test_an_unknown_type_is_warned_about_not_absorbed(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A future watchdog type must be loud, not quietly counted."""
+        import logging
+
+        handler = _BufferingHandler(WatchRoot(tmp_path, "docs", "alice"))
+        with caplog.at_level(logging.WARNING, logger="ebabf.collectors.filesystem"):
+            handler.record("teleported", "/home/alice/Documents/a.txt")
+
+        activity = handler.drain()
+        assert activity.total == 0
+        assert activity.ignored == 1
+        assert any("unrecognised event type" in r.message for r in caplog.records)
+
+    def test_the_warning_fires_once_per_type(self, tmp_path: Path, caplog) -> None:
+        import logging
+
+        handler = _BufferingHandler(WatchRoot(tmp_path, "docs", "alice"))
+        with caplog.at_level(logging.WARNING, logger="ebabf.collectors.filesystem"):
+            for _ in range(50):
+                handler.record("teleported", "/a/b")
+        assert len([r for r in caplog.records if "unrecognised" in r.message]) == 1
+
+    def test_known_non_mutations_do_not_warn(self, tmp_path: Path, caplog) -> None:
+        import logging
+
+        handler = _BufferingHandler(WatchRoot(tmp_path, "docs", "alice"))
+        with caplog.at_level(logging.WARNING, logger="ebabf.collectors.filesystem"):
+            handler.record("opened", "/a/b")
+            handler.record("closed", "/a/b")
+        assert [r for r in caplog.records if "unrecognised" in r.message] == []
+
+    def test_the_rate_measures_mutations_only(
+        self, collector_context: CollectorContext, tmp_path: Path
+    ) -> None:
+        from datetime import timedelta
+
+        base = datetime(2026, 3, 1, 12, 0, 0, tzinfo=timezone.utc)
+        offset = {"seconds": 0}
+        context = CollectorContext(
+            host_id=collector_context.host_id,
+            tenant_id=collector_context.tenant_id,
+            pseudonymizer=collector_context.pseudonymizer,
+            clock=lambda: base + timedelta(seconds=offset["seconds"]),
+        )
+        collector = FileMonitorCollector(context, roots=_roots(tmp_path))
+        list(collector.collect())
+        offset["seconds"] = 10
+
+        handler = collector._handlers["alice:Documents"]
+        for index in range(10):
+            handler.record("modified", f"/a/{index}")
+        for index in range(500):  # a scan reading a lot of files
+            handler.record("opened", f"/a/{index}")
+
+        event = next(iter(collector.collect()))
+        assert event.raw_attributes["file_modification_rate"] == pytest.approx(1.0)
+        assert event.raw_attributes["ignored_events"] == 500

@@ -45,6 +45,16 @@ Only `dns_entropy` is stored, per the feature table in spec 5.2. Layer 4
 intelligence. That is a Sprint 4 requirement and a separate privacy decision;
 it is not assumed here.
 
+## Reads are seen but not recorded
+
+watchdog reports `opened` and `closed` events, so the agent is told which files
+a user reads. They are counted as `ignored_events` and discarded: spec 5.3 asks
+about writes, and recording every file read would be surveillance the spec
+never asked for.
+
+If a later sprint wants read activity as a feature (exfiltration staging, say),
+it is a privacy decision, not a plumbing one.
+
 ## File actor attribution
 
 inotify cannot say which process changed a file, so events are attributed by

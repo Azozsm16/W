@@ -239,3 +239,45 @@ The registry returns a `CoverageReport` naming every collector that could not
 start and why. Spec 11.3 requires a coverage gap to be announced always: a
 tool silently missing a whole observation surface is more dangerous than one
 plainly switched off, because the operator believes they are covered.
+
+---
+
+## D-018 — Library interfaces are pinned, not remembered
+
+**What went wrong**: `_BufferingHandler.record()` classified filesystem events
+with string literals typed from memory - `"created"`, `"deleted"`, `"moved"` -
+and folded everything else into `modified`. watchdog 6.0 also emits `opened`,
+`closed` and `closed_no_write`.
+
+Measured on a real inotify watch:
+
+| Action | Counted as modifications | Correct |
+|---|---|---|
+| Writing 20 files | 80 | 40 |
+| **Reading 20 files** | **40** | **0** |
+
+A backup job, an antivirus scan or a recursive grep over a documents folder
+registered as mass file modification - the ransomware signature - in a system
+whose one binding metric is precision (spec 13.1) and whose hard constraint is
+five alerts per host per day.
+
+The bug was silent. Nothing failed; the numbers were simply wrong. It would
+have reached Sprint 4 as a poisoned baseline.
+
+**Settled**, three parts:
+
+1. Constants are imported from the library, never retyped. `MUTATION_EVENTS`
+   is keyed on watchdog's own `EVENT_TYPE_*` values.
+2. Classification is a positive allowlist. Anything not a known mutation is not
+   counted as one, so a type added by a future watchdog is handled correctly
+   rather than absorbed.
+3. An unrecognised type raises a warning once and increments `ignored_events`.
+   The previous bug survived because it was silent.
+
+`tests/test_library_contracts.py` pins every assumption this agent makes about
+psutil, scapy and watchdog - field names, event types, exception classes,
+signatures - so a library upgrade fails the build instead of quietly emptying
+a field. That file exists because of this bug.
+
+**Rule added to CLAUDE.md**: verify a library's interface before using it;
+never assume attribute or function names from memory.

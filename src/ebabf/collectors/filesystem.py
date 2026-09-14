@@ -29,6 +29,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Iterator
 
+from watchdog.events import (
+    EVENT_TYPE_CREATED,
+    EVENT_TYPE_DELETED,
+    EVENT_TYPE_MODIFIED,
+    EVENT_TYPE_MOVED,
+)
+
 from ebabf.collectors.base import Collector, CollectorContext
 from ebabf.collectors.registry import register_collector
 from ebabf.schema import Event, EventSource
@@ -40,6 +47,28 @@ logger = logging.getLogger(__name__)
 _INOTIFY_LIMIT_PATH = "/proc/sys/fs/inotify/max_user_watches"
 # Warn once the agent is using this share of the host's watch budget.
 _WATCH_WARN_RATIO = 0.5
+
+# Which watchdog events count as a change to a file.
+#
+# A positive allowlist, taken from watchdog's own constants rather than typed
+# from memory, and bound to the four mutation types. Everything else -
+# `opened`, `closed`, `closed_no_write`, and whatever a future version adds -
+# is not a modification and is not counted as one.
+#
+# This was a bug: the previous code folded every unrecognised type into
+# `modified`, so reading 20 files registered as 40 modifications. A backup
+# job or a recursive grep over a documents folder looked exactly like mass
+# encryption, in a system whose one binding metric is precision.
+MUTATION_EVENTS: dict[str, str] = {
+    EVENT_TYPE_CREATED: "created",
+    EVENT_TYPE_DELETED: "deleted",
+    EVENT_TYPE_MODIFIED: "modified",
+    EVENT_TYPE_MOVED: "moved",
+}
+
+# Known non-mutating types. Listed so they are discarded quietly, while a type
+# from outside both sets raises a warning.
+_KNOWN_NON_MUTATION_EVENTS = frozenset({"opened", "closed", "closed_no_write"})
 
 SENSITIVE_CATEGORIES: dict[str, tuple[str, ...]] = {
     "system_config": ("/etc",),
@@ -69,6 +98,9 @@ class FileActivity:
     modified: int = 0
     deleted: int = 0
     moved: int = 0
+    ignored: int = 0
+    """Non-mutating events seen and deliberately not counted (reads, opens)."""
+
     distinct_paths: set[str] = field(default_factory=set)
     sensitive_categories: set[str] = field(default_factory=set)
     first_seen: float = 0.0
@@ -104,28 +136,52 @@ class _BufferingHandler:
         self._root = root
         self._activity = FileActivity()
         self._lock = threading.Lock()
+        self._unknown_seen: set[str] = set()
 
     def record(self, event_type: str, path: str, *, now: float | None = None) -> None:
+        """Count one filesystem event.
+
+        Only the four mutation types are counted. Opens and closes are seen and
+        discarded: spec 5.3 asks about writes, and recording every file a user
+        reads would be surveillance the spec never asked for.
+        """
+        counter = MUTATION_EVENTS.get(event_type)
         moment = now if now is not None else time.time()
+
         with self._lock:
             activity = self._activity
             if activity.first_seen == 0.0:
                 activity.first_seen = moment
             activity.last_seen = moment
-            if event_type == "created":
-                activity.created += 1
-            elif event_type == "deleted":
-                activity.deleted += 1
-            elif event_type == "moved":
-                activity.moved += 1
-            else:
-                activity.modified += 1
+
+            if counter is None:
+                activity.ignored += 1
+                self._note_unknown(event_type)
+                return
+
+            setattr(activity, counter, getattr(activity, counter) + 1)
             # Hashed, not stored: we need the count of distinct files, not
             # which files they were.
             activity.distinct_paths.add(str(hash(path)))
             category = classify_sensitive(path)
             if category is not None:
                 activity.sensitive_categories.add(category)
+
+    def _note_unknown(self, event_type: str) -> None:
+        """Warn once per unrecognised event type.
+
+        A watchdog release adding a type must be noticed, not absorbed. It is
+        already handled correctly - an unknown type is not a mutation - but
+        silence here is how the previous bug survived.
+        """
+        if event_type in _KNOWN_NON_MUTATION_EVENTS or event_type in self._unknown_seen:
+            return
+        self._unknown_seen.add(event_type)
+        logger.warning(
+            "watchdog emitted an unrecognised event type %r; not counted as a "
+            "modification. Check MUTATION_EVENTS against this watchdog version.",
+            event_type,
+        )
 
     def dispatch(self, event: Any) -> None:  # pragma: no cover - driven by watchdog
         if getattr(event, "is_directory", False):
@@ -243,6 +299,7 @@ class FileMonitorCollector(Collector):
             "files_deleted": activity.deleted,
             "files_moved": activity.moved,
             "events_total": activity.total,
+            "ignored_events": activity.ignored,
             "distinct_file_count": len(activity.distinct_paths),
             "window_seconds": round(window, 3) if window else None,
         }
