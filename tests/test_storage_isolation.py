@@ -142,12 +142,29 @@ class TestRestrictedInterfacesHaveOnePermittedCaller:
         index = source.index(f"def {method}")
         assert "RESTRICTED" in source[index : index + 1200]
 
-    def test_only_the_bridge_imports_both_stores(self) -> None:
+    def test_only_the_bridge_and_the_composition_root_hold_both_stores(self) -> None:
+        """Holding both is allowed in two places; joining them, in one.
+
+        `bootstrap.py` must hold both - building the agent needs the identity
+        store for the pseudonymiser and the event store for output. What it
+        must not do is call the restricted methods, and the tests above
+        enforce that for every module including this one.
+        """
+        permitted = {"bridge.py", "bootstrap.py"}
         holders: set[str] = set()
         for path in SRC_ROOT.rglob("*.py"):
             text = path.read_text()
             if "EventStore" in text and "IdentityStore" in text and path.name != "__init__.py":
                 holders.add(path.name)
-        assert holders == {"bridge.py"}, (
-            f"only the bridge may hold both stores; also found: {sorted(holders - {'bridge.py'})}"
+        assert holders <= permitted, (
+            f"only {sorted(permitted)} may hold both stores; also found: "
+            f"{sorted(holders - permitted)}"
         )
+
+    def test_the_composition_root_calls_no_restricted_method(self) -> None:
+        bootstrap = SRC_ROOT / "bootstrap.py"
+        for method in RESTRICTED_CALLERS:
+            assert method not in self._calls_in(bootstrap), (
+                f"{method} must be reached through ebabf.storage.bridge, not the "
+                "composition root"
+            )

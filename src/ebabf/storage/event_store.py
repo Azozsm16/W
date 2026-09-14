@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -116,12 +117,20 @@ class EventStore:
         self._path = Path(db_path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock
-        self._conn = sqlite3.connect(self._path, isolation_level=None)
+        # check_same_thread=False plus an explicit lock: the agent sweeps from
+        # a worker thread while collectors run in their own, and a connection
+        # pinned to its creating thread would fail there. SQLite is safe for
+        # serialised access; the lock is what serialises it.
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(
+            self._path, isolation_level=None, check_same_thread=False
+        )
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.executescript(_SCHEMA)
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     def __enter__(self) -> "EventStore":
         return self
@@ -163,15 +172,17 @@ class EventStore:
             payload["schema_version"],
         )
         placeholders = ", ".join("?" * len(_COLUMNS))
-        self._conn.execute(
-            f"INSERT INTO events ({', '.join(_COLUMNS)}) VALUES ({placeholders})", values
-        )
+        with self._lock:
+            self._conn.execute(
+                f"INSERT INTO events ({', '.join(_COLUMNS)}) VALUES ({placeholders})", values
+            )
         return stamped
 
     def get(self, event_id: str) -> Event | None:
-        row = self._conn.execute(
-            f"SELECT {', '.join(_COLUMNS)} FROM events WHERE event_id = ?", (event_id,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {', '.join(_COLUMNS)} FROM events WHERE event_id = ?", (event_id,)
+            ).fetchone()
         return self._to_event(row) if row else None
 
     def query(
@@ -205,15 +216,17 @@ class EventStore:
 
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
-        rows = self._conn.execute(
-            f"SELECT {', '.join(_COLUMNS)} FROM events{where} "
-            "ORDER BY ingested_at DESC, event_id DESC LIMIT ?",
-            params,
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {', '.join(_COLUMNS)} FROM events{where} "
+                "ORDER BY ingested_at DESC, event_id DESC LIMIT ?",
+                params,
+            ).fetchall()
         return [self._to_event(row) for row in rows]
 
     def count(self) -> int:
-        return int(self._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+        with self._lock:
+            return int(self._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
 
     def verdict_types(self, event_ids: Iterable[str]) -> dict[str, str | None]:
         """Read the generated column directly - used to prove it matches Python."""
@@ -221,9 +234,10 @@ class EventStore:
         if not ids:
             return {}
         marks = ", ".join("?" * len(ids))
-        rows = self._conn.execute(
-            f"SELECT event_id, verdict_type FROM events WHERE event_id IN ({marks})", ids
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT event_id, verdict_type FROM events WHERE event_id IN ({marks})", ids
+            ).fetchall()
         return dict(rows)
 
     def column_names(self) -> list[str]:
@@ -232,7 +246,10 @@ class EventStore:
         table_xinfo, not table_info: the latter omits VIRTUAL generated
         columns, which would hide `verdict_type` from the isolation tests.
         """
-        return [row[1] for row in self._conn.execute("PRAGMA table_xinfo(events)").fetchall()]
+        with self._lock:
+            return [
+                row[1] for row in self._conn.execute("PRAGMA table_xinfo(events)").fetchall()
+            ]
 
     def stored_column_names(self) -> list[str]:
         """Only the columns that hold written data.
@@ -240,11 +257,12 @@ class EventStore:
         The `hidden` flag is 0 for an ordinary column, 2 for VIRTUAL and 3 for
         STORED generated columns.
         """
-        return [
-            row[1]
-            for row in self._conn.execute("PRAGMA table_xinfo(events)").fetchall()
-            if row[6] == 0
-        ]
+        with self._lock:
+            return [
+                row[1]
+                for row in self._conn.execute("PRAGMA table_xinfo(events)").fetchall()
+                if row[6] == 0
+            ]
 
     def _to_event(self, row: tuple[Any, ...]) -> Event:
         data = dict(zip(_COLUMNS, row))

@@ -142,3 +142,100 @@ Today it passes, because `level` is None. The moment events start carrying a
 level it begins refusing anything below Critical - with no configuration
 change and nobody having to remember. There is deliberately no setting that
 turns it off; a gate with an off switch is a back door.
+
+---
+
+# Sprint 2 decisions
+
+| # | Decision | Settled | Spec reference |
+|---|---|---|---|
+| D-010 | `file_entropy_change` is not implemented - the privacy principle wins | Sprint 2 | 5.3, 5.5 |
+| D-011 | Network features come from packet capture, headers only | Sprint 2 | 5.2, 12 |
+| D-012 | Unattributable flows go to a reserved host subject | Sprint 2 | 5.2, principle 1 |
+| D-013 | File events are attributed by path ownership, not by actor | Sprint 2 | 5.3 |
+| D-014 | File paths are not stored; only labels, categories and counts | Sprint 2 | 5.3, 11.2 |
+| D-015 | Sudo command text is discarded at the parser | Sprint 2 | 5.4, principle 5 |
+| D-016 | Watched roots are sensitive paths plus home document directories | Sprint 2 | 5.3 |
+| D-017 | Coverage gaps are reported by the registry, never silent | Sprint 2 | 11.3 |
+
+## D-010 — `file_entropy_change` is not implemented
+
+**The conflict**: spec 5.3 lists `file_entropy_change` to catch mass
+encryption. Spec 5.5's note and principle 5 both state that file content is
+never collected. Entropy cannot be computed without reading file bytes.
+
+**Settled**: the principle wins; the field is dropped. `file_modification_rate`
+and `sensitive_path_write` carry the ransomware signal instead, and both are
+pure metadata - a mass-encryption run is visible as hundreds of files rewritten
+per second without opening any of them.
+
+**What this costs**: slow encryption that preserves file sizes and names may
+pass unremarked by this layer. That is the price of the principle, and it is
+recorded rather than hidden.
+
+The collector's module holds no file-reading call at all, and a test asserts
+so, because a principle checked only by intention decays.
+
+## D-011 — Packet capture, headers only
+
+Spec 12 sanctions `scapy`. Capture was chosen over socket-table polling
+because a beacon that opens a 200 ms connection every 60 seconds slips between
+polls, and beaconing is the flagship detection.
+
+**Boundary**: choosing capture as the *method* does not relax principle 5 about
+*what may be read from it*. The collector reads IP and TCP/UDP header fields,
+frame lengths, and DNS question names. Payloads are never parsed, and
+`AsyncSniffer` runs with `store=False` so no frame is retained.
+
+**Open risk**: spec 13 caps CPU at 5% under realistic load. Python-level
+capture is the most expensive thing in the agent and this has not been
+measured yet. `PacketSource` is an interface precisely so the implementation
+can be swapped after Sprint 9 measures it.
+
+## D-012 — Unattributable flows go to a reserved host subject
+
+A captured packet carries no pid, so the wire alone cannot say who opened a
+connection. Attribution comes from a separate socket-table snapshot, which is
+partial without privileges and races against short-lived sockets.
+
+**Settled**: a flow with no matching socket is recorded against `__host__`,
+pseudonymised like any other subject, with `subject_attributed: false` on the
+event. The alternative - assigning it to a plausible user - is the guessing
+principle 1 forbids.
+
+## D-013 — File events are attributed by path, not by actor
+
+inotify reports what changed, never who changed it. Events are therefore
+attributed to the owner of the watched root. Real actor attribution needs
+fanotify or auditd; both are out of scope for v1 and recorded as debts.
+
+## D-014 — File paths are not stored
+
+Spec 11.2's third retention tier names paths as identifying, alongside
+identities and IPs, and `~/Documents/...` frequently is. Events carry the
+watched root's label, the sensitive-path category, and counts. Distinct files
+are counted through a hash so the number survives while the names do not.
+
+## D-015 — Sudo command text is discarded at the parser
+
+A sudo line in the auth log carries the command that ran, and command lines
+routinely carry secrets (`sudo mysql -pHUNTER2`). The parser extracts the fact
+that sudo was used and the user who used it, and drops the rest of the line
+before it can reach an event.
+
+## D-016 — Watched roots: sensitive paths plus home documents
+
+`/etc`, `~/.ssh` and autostart locations serve `sensitive_path_write`.
+Document directories are watched as well because that is where ransomware
+encrypts - watching `/etc` alone would miss the case the feature exists for.
+
+inotify's default watch budget is finite, so the collector counts the watches
+it holds and warns when it passes half the host's limit. Watches beyond the
+limit fail silently at the kernel, which would be an undeclared coverage gap.
+
+## D-017 — Coverage gaps are declared
+
+The registry returns a `CoverageReport` naming every collector that could not
+start and why. Spec 11.3 requires a coverage gap to be announced always: a
+tool silently missing a whole observation surface is more dangerous than one
+plainly switched off, because the operator believes they are covered.

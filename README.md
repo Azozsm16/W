@@ -7,7 +7,9 @@ together.
 Reference specification: [`docs/behavioral-firewall-spec.md`](docs/behavioral-firewall-spec.md).
 Implementation decisions: [`docs/decisions.md`](docs/decisions.md).
 
-## Status — Sprint 1 (Foundation) complete
+## Status — Sprints 1 and 2 complete
+
+**Sprint 1 — Foundation**
 
 | Component | Where |
 |---|---|
@@ -18,7 +20,31 @@ Implementation decisions: [`docs/decisions.md`](docs/decisions.md).
 | Storage: events and identity, physically separate | `src/ebabf/storage/` |
 | Process collector | `src/ebabf/collectors/process.py` |
 
-Sprints 2-9 are not started. Declared gaps: [`docs/sprint-1-debts.md`](docs/sprint-1-debts.md).
+**Sprint 2 — Collectors**
+
+| Component | Where |
+|---|---|
+| Network collector (packet capture, headers only) | `src/ebabf/collectors/network.py` |
+| File monitor (inotify) | `src/ebabf/collectors/filesystem.py` |
+| User activity collector (UEBA) | `src/ebabf/collectors/user_activity.py` |
+| Platform abstraction and coverage reporting | `src/ebabf/collectors/registry.py` |
+| Agent runner and baseline recording | `src/ebabf/runner.py`, `src/ebabf/bootstrap.py` |
+
+Sprints 3-9 are not started. Declared gaps:
+[`docs/sprint-1-debts.md`](docs/sprint-1-debts.md),
+[`docs/sprint-2-debts.md`](docs/sprint-2-debts.md).
+
+## Run the agent
+
+```bash
+ebabf-agent coverage              # which collectors can run on this host
+ebabf-agent run --interval 30     # sweep every 30s
+ebabf-agent baseline --db baseline.db   # record a clean Benign Baseline (spec 10.1)
+```
+
+Packet capture needs `CAP_NET_RAW`; without it the network collector reports
+itself unavailable and the gap is named in the coverage report rather than
+passing unnoticed.
 
 ## Install
 

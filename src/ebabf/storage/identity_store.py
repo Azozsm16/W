@@ -16,6 +16,7 @@ leave a record - not by convention, by construction.
 from __future__ import annotations
 
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -75,13 +76,21 @@ class IdentityStore:
         self._cipher = cipher
         # No ATTACH is ever issued on this connection, so no SQL statement
         # reachable from here can join against events.db.
-        self._conn = sqlite3.connect(self._path, isolation_level=None)
+        #
+        # check_same_thread=False plus a lock, for the same reason as the event
+        # store: pseudonyms are minted from whichever thread a collector sweeps
+        # on, not the one that opened the database.
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(
+            self._path, isolation_level=None, check_same_thread=False
+        )
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(_SCHEMA)
         self._path.chmod(0o600)
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     def __enter__(self) -> "IdentityStore":
         return self
@@ -103,16 +112,17 @@ class IdentityStore:
         if not tenant_id or not subject:
             raise ValueError("tenant_id and subject are required")
         pseudonym = f"USR-{uuid.uuid4().hex}"
-        self._conn.execute(
-            "INSERT INTO identity_map (pseudonym, tenant_id, subject_ciphertext, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (
-                pseudonym,
-                tenant_id,
-                self._cipher.encrypt(subject),
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO identity_map (pseudonym, tenant_id, subject_ciphertext, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    pseudonym,
+                    tenant_id,
+                    self._cipher.encrypt(subject),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
         return pseudonym
 
     # -- restricted interfaces ----------------------------------------------
@@ -131,10 +141,11 @@ class IdentityStore:
         Handing out this mapping wholesale would be handing out the reverse
         one too, since a dict is trivially inverted.
         """
-        rows = self._conn.execute(
-            "SELECT pseudonym, subject_ciphertext FROM identity_map WHERE tenant_id = ?",
-            (tenant_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT pseudonym, subject_ciphertext FROM identity_map WHERE tenant_id = ?",
+                (tenant_id,),
+            ).fetchall()
         return {self._cipher.decrypt(ciphertext): pseudonym for pseudonym, ciphertext in rows}
 
     def begin_break_glass_access(
@@ -155,20 +166,21 @@ class IdentityStore:
         The audit row is written before any decryption, not after: written
         after, any exception in between yields a disclosure with no record.
         """
-        cursor = self._conn.execute(
-            "INSERT INTO identity_access_log "
-            "(pseudonym, event_id, actor, second_approver, reason, requested_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                pseudonym,
-                event_id,
-                actor,
-                second_approver,
-                reason,
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-        access_id = int(cursor.lastrowid)
+        with self._lock:
+            cursor = self._conn.execute(
+                "INSERT INTO identity_access_log "
+                "(pseudonym, event_id, actor, second_approver, reason, requested_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    pseudonym,
+                    event_id,
+                    actor,
+                    second_approver,
+                    reason,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            access_id = int(cursor.lastrowid)
         return AccessGrant(access_id=access_id, pseudonym=pseudonym)
 
     def resolve_subject_with_grant(self, grant: AccessGrant) -> str:
@@ -180,10 +192,11 @@ class IdentityStore:
         if not isinstance(grant, AccessGrant):
             raise TypeError("identity disclosure requires an AccessGrant")
 
-        audit_row = self._conn.execute(
-            "SELECT pseudonym FROM identity_access_log WHERE access_id = ?",
-            (grant.access_id,),
-        ).fetchone()
+        with self._lock:
+            audit_row = self._conn.execute(
+                "SELECT pseudonym FROM identity_access_log WHERE access_id = ?",
+                (grant.access_id,),
+            ).fetchone()
         if audit_row is None:
             raise PermissionError(
                 f"access grant {grant.access_id} has no audit record; refusing disclosure"
@@ -193,10 +206,11 @@ class IdentityStore:
                 "access grant does not match its audit record; refusing disclosure"
             )
 
-        row = self._conn.execute(
-            "SELECT subject_ciphertext FROM identity_map WHERE pseudonym = ?",
-            (grant.pseudonym,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT subject_ciphertext FROM identity_map WHERE pseudonym = ?",
+                (grant.pseudonym,),
+            ).fetchone()
         if row is None:
             raise PseudonymNotFound(grant.pseudonym)
         return self._cipher.decrypt(row[0])
@@ -205,11 +219,12 @@ class IdentityStore:
 
     def access_log(self, limit: int = 100) -> list[dict[str, object]]:
         """The disclosure trail. Contains pseudonyms and reasons, no identities."""
-        rows = self._conn.execute(
-            "SELECT access_id, pseudonym, event_id, actor, second_approver, reason, requested_at "
-            "FROM identity_access_log ORDER BY access_id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT access_id, pseudonym, event_id, actor, second_approver, reason, requested_at "
+                "FROM identity_access_log ORDER BY access_id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         keys = (
             "access_id",
             "pseudonym",
@@ -222,10 +237,13 @@ class IdentityStore:
         return [dict(zip(keys, row)) for row in rows]
 
     def count(self, tenant_id: str | None = None) -> int:
-        if tenant_id is None:
-            return int(self._conn.execute("SELECT COUNT(*) FROM identity_map").fetchone()[0])
-        return int(
-            self._conn.execute(
-                "SELECT COUNT(*) FROM identity_map WHERE tenant_id = ?", (tenant_id,)
-            ).fetchone()[0]
-        )
+        with self._lock:
+            if tenant_id is None:
+                return int(
+                    self._conn.execute("SELECT COUNT(*) FROM identity_map").fetchone()[0]
+                )
+            return int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM identity_map WHERE tenant_id = ?", (tenant_id,)
+                ).fetchone()[0]
+            )

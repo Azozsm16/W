@@ -26,6 +26,7 @@ from typing import Any, Iterator
 import psutil
 
 from ebabf.collectors.base import Collector
+from ebabf.collectors.registry import register_collector
 from ebabf.schema import Event, EventSource
 
 __all__ = ["ProcessCollector"]
@@ -43,6 +44,7 @@ _ATTRS = [
 ]
 
 
+@register_collector
 class ProcessCollector(Collector):
     """Polls the process table and emits one Event per live process."""
 
