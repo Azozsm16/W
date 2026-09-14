@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime state - must never reach the repository.
+# Identity material and event data are regulated data (spec 11.2).
+*.db
+*.db-journal
+*.db-wal
+*.key
+secrets/
+var/
+
+# Editors
+.idea/
+.vscode/
+*.swp
