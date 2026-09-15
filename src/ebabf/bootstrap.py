@@ -50,7 +50,9 @@ def build_agent(
 
     cipher = IdentityCipher.from_key_file(config.identity_key_path, create_if_missing=True)
     identity_store = IdentityStore(config.identity_db_path, cipher)
-    event_store = EventStore(event_db_path or config.event_db_path)
+    event_store = EventStore(
+        event_db_path or config.event_db_path, max_events=config.max_stored_events
+    )
 
     context = CollectorContext(
         host_id=config.host_id,
@@ -81,6 +83,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ebabf-agent", description=__doc__)
     parser.add_argument("--interval", type=float, default=30.0, help="seconds between sweeps")
     parser.add_argument("--only", nargs="*", default=None, help="restrict to these collectors")
+    parser.add_argument(
+        "--max-events",
+        type=int,
+        default=None,
+        help="cap on stored events; 0 disables the cap (spec 11.3)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("run", help="run the agent")
     baseline = sub.add_parser(
@@ -94,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     config = AgentConfig()
+    if args.max_events is not None:
+        config = replace(config, max_stored_events=args.max_events)
     if args.command == "baseline":
         # Enforcement off while recording a baseline: the machine is known
         # clean, and anything blocked would poison the very data being gathered.

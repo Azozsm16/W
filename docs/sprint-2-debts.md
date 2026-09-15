@@ -62,13 +62,32 @@ path ownership (D-013). A file written under `/home/alice` by a compromised
 service running as root is attributed to alice. fanotify or auditd would fix
 this and are out of scope for v1.
 
-## Baseline recording is manual
+## Baseline recording: two gaps left open deliberately
 
 `ebabf-agent baseline --db baseline.db` runs the agent with enforcement off and
-writes to a separate database. Nothing yet schedules it for the 7-14 days spec
-10.1 requires, verifies the host was clean before recording (spec 15, Baseline
-Poisoning), or reports progress. Those belong with the feature pipeline in
-Sprint 3.
+writes to a separate database. Storage is now bounded and every drop is
+recorded (D-019), which was the gap that could corrupt a run silently. Two
+remain, both of which fail loudly rather than quietly:
+
+- **No progress report.** There is no way to see how many days have elapsed or
+  how many events were gathered without opening the database. A run can be
+  inspected with `EventStore.count()` and `dropped_event_count()`; nothing
+  presents it.
+- **No resume across reboots.** Restarting the machine stops the recording and
+  nothing brings it back - there is no systemd unit. The operator has to
+  notice and restart it.
+
+Also still open: nothing verifies the host was clean before recording starts
+(spec 15, Baseline Poisoning). That verification is a procedure, not code, and
+belongs with whoever owns the machine.
+
+## Storage is bounded by rows, not by bytes
+
+The cap counts events, not disk usage (D-019). At the measured ~420 bytes per
+event the default bounds the database near 840 MB, but an unusually large
+`raw_attributes` payload would push that up. Nothing watches free disk space
+directly, so a disk filled by something *else* on the host still stops the
+agent's writes. Byte-level accounting and a free-space floor are not built.
 
 ## No service unit
 

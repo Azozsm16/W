@@ -13,6 +13,8 @@ import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ebabf.storage.event_store import DEFAULT_MAX_EVENTS
+
 __all__ = ["AgentConfig", "DEFAULT_TENANT_ID"]
 
 # v1 is a single-host agent, but the field exists from day one (decision 19).
@@ -42,6 +44,12 @@ class AgentConfig:
     # Kill-switch sentinel. Must live in a directory only the agent's owner
     # can write to - see ebabf.engine.killswitch.
     kill_switch_path: Path = Path("/etc/ebabf/KILL_SWITCH")
+
+    # Bound on stored events (spec 11.3). Past this the oldest low-severity
+    # events are dropped and the drop is recorded. 0 means unbounded, which is
+    # a deliberate choice for a machine with the disk to spare - an unbounded
+    # store that fills the disk stops recording silently.
+    max_stored_events: int = DEFAULT_MAX_EVENTS
 
     # The single setting that turns enforcement off entirely (spec 4, 14.2).
     # Training Mode (spec 17.1) is this set to False.

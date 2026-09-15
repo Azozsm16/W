@@ -281,3 +281,46 @@ a field. That file exists because of this bug.
 
 **Rule added to CLAUDE.md**: verify a library's interface before using it;
 never assume attribute or function names from memory.
+
+---
+
+## D-019 — Bounded storage, with the drop on the record
+
+Spec 11.3: "local storage full -> drop the oldest low-severity events first,
+with the drop logged." Unimplemented until now, and on the critical path: a
+7-14 day baseline recording (spec 10.1) at this host's event rate is roughly
+three million events, and a store that filled the disk would stop recording
+**silently** on day ten. The gap would surface at training time in Sprint 4,
+by which point the two weeks are gone.
+
+**Settled**, in three parts:
+
+1. **A cap.** `AgentConfig.max_stored_events`, default 2,000,000. Measured at
+   ~420 bytes per event, that bounds the database at roughly 840 MB. Setting it
+   to 0 disables the cap - a real choice for a machine with the disk to spare,
+   and an explicit one rather than the default.
+2. **An eviction order.** Least worth keeping first: severity ascending, then
+   age ascending. Severity outranks age, so the oldest Critical event outlives
+   the newest Normal one.
+3. **A durable record.** Every drop writes a row to `overflow_drops` - when,
+   how many, the breakdown by level, the time span lost - and logs at WARNING.
+
+The record is the half that matters. A store that quietly discarded a week of
+a baseline still looks complete when you come to train on it; one that says so
+can be re-run. `dropped_event_count()` returning non-zero is the signal that
+the data has a hole in it.
+
+**Where unscored events rank**: between Low and Medium. Nothing has judged
+them, so they are not dropped ahead of an event positively known to be boring,
+nor kept ahead of one positively known to be interesting. Uncertainty ranks
+between known-boring and known-interesting, and is not silently treated as
+either - the same reasoning as spec 6.3's missing-layer rule.
+
+Today every event is unscored, so the order degrades to plain oldest-first,
+which is what baseline recording wants. It begins sorting by severity on its
+own once the scoring engine lands in Sprint 4 - the self-arming pattern already
+used for the Break-Glass severity gate (D-009).
+
+**Named for overflow, not retention.** Spec 11.2's three-tier retention policy
+is a different mechanism arriving in Sprint 7. Sharing a name would let one
+hide behind the other.
