@@ -76,9 +76,27 @@ passing unnoticed.
 
 ## Install
 
+Requires **Linux** (Ubuntu 22.04 or newer) and **Python 3.11+**. The agent
+reads `/proc`, inotify and raw sockets, none of which exist on Windows or
+macOS; on those the collectors report themselves unavailable rather than
+pretending to work.
+
 ```bash
+sudo apt install -y python3-venv libpcap0.8   # libpcap0.8t64 on Ubuntu 24.04+
+git clone https://github.com/Azozsm16/W.git
+cd W
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
+```
+
+`libpcap` is what compiles the capture filter. Without it the network collector
+reports itself unavailable and says so in `ebabf-agent coverage` - the other
+three keep running.
+
+Check what the host supports before anything else:
+
+```bash
+.venv/bin/ebabf-agent coverage
 ```
 
 ## Test

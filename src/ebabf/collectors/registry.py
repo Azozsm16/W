@@ -100,7 +100,10 @@ class CollectorRegistry:
             collector_type = self._types[name]
             try:
                 if not collector_type.is_supported():
-                    unavailable.append((name, f"not supported on {platform.system()}"))
+                    reason = collector_type.support_reason()
+                    unavailable.append(
+                        (name, reason or f"not supported on {platform.system()}")
+                    )
                     continue
                 active.append(collector_type(context))
             except Exception as exc:  # noqa: BLE001 - one surface down, not the agent

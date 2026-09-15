@@ -62,6 +62,16 @@ class Collector(ABC):
         by editing the layers above.
         """
 
+    @classmethod
+    def support_reason(cls) -> str | None:
+        """Why this collector cannot run here, when it cannot.
+
+        The coverage report exists to tell an operator what to fix. "not
+        supported on Linux" tells them nothing; "libpcap is missing" tells them
+        what to install. Collectors that know the specific cause override this.
+        """
+        return None
+
     @abstractmethod
     def collect(self) -> Iterator[Event]:
         """One sweep of the observation surface.

@@ -444,6 +444,11 @@ class NetworkCollector(Collector):
             logger.warning("network collector unavailable: %s", reason)
         return available
 
+    @classmethod
+    def support_reason(cls) -> str | None:
+        available, reason = ScapyPacketSource.is_available()
+        return None if available else reason
+
     @property
     def is_capturing(self) -> bool:
         """Whether the capture is genuinely running, not merely started."""

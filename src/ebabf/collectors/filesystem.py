@@ -224,10 +224,16 @@ class FileMonitorCollector(Collector):
 
     @classmethod
     def is_supported(cls) -> bool:
-        if not os.path.exists("/proc/sys/fs/inotify/max_user_watches"):
+        if not os.path.exists(_INOTIFY_LIMIT_PATH):
             logger.warning("file monitor unavailable: inotify not present")
             return False
         return True
+
+    @classmethod
+    def support_reason(cls) -> str | None:
+        if os.path.exists(_INOTIFY_LIMIT_PATH):
+            return None
+        return f"inotify is not available ({_INOTIFY_LIMIT_PATH} is missing)"
 
     # -- lifecycle ----------------------------------------------------------
 
