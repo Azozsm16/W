@@ -367,3 +367,75 @@ class TestCaptureAvailability:
         assert isinstance(available, bool)
         if not available:
             assert reason, "unavailability must come with a reason (spec 11.3)"
+
+
+class TestCaptureFailureIsNotSilent:
+    """scapy reports a dead capture as a healthy one; both lies are caught."""
+
+    def test_libpcap_is_required_for_a_bpf_filter(self) -> None:
+        available, reason = ScapyPacketSource.is_available(bpf_filter="ip or ip6")
+        if not available:
+            assert reason, "unavailability must come with a reason"
+        # With no filter the libpcap requirement does not apply.
+        no_filter, _ = ScapyPacketSource.is_available(bpf_filter=None)
+        assert isinstance(no_filter, bool)
+
+    def test_an_uncompilable_filter_is_reported(self) -> None:
+        available, reason = ScapyPacketSource.is_available(bpf_filter="not a real filter")
+        assert available is False
+        assert reason
+
+    def test_is_supported_follows_availability(self) -> None:
+        available, _ = ScapyPacketSource.is_available()
+        assert NetworkCollector.is_supported() is available
+
+    def test_a_dead_capture_thread_raises(self, monkeypatch) -> None:
+        """`sniffer.running` stays True after the thread dies, so liveness and
+        the stored exception are what get checked."""
+        from ebabf.collectors.network import CaptureUnavailable
+
+        class DeadThread:
+            @staticmethod
+            def is_alive() -> bool:
+                return False
+
+        class FakeSniffer:
+            running = True
+            exception = None
+            thread = DeadThread()
+
+            def start(self) -> None:
+                return None
+
+        source = ScapyPacketSource()
+        source._sniffer = FakeSniffer()
+        with pytest.raises(CaptureUnavailable, match="stopped immediately"):
+            source._raise_if_capture_died()
+
+    def test_a_stored_exception_raises(self) -> None:
+        from ebabf.collectors.network import CaptureUnavailable
+
+        class FakeSniffer:
+            running = True
+            exception = OSError("no permission")
+            thread = None
+
+        source = ScapyPacketSource()
+        source._sniffer = FakeSniffer()
+        with pytest.raises(CaptureUnavailable, match="failed to start"):
+            source._raise_if_capture_died()
+
+    def test_a_live_capture_does_not_raise(self) -> None:
+        class LiveThread:
+            @staticmethod
+            def is_alive() -> bool:
+                return True
+
+        class FakeSniffer:
+            running = True
+            exception = None
+            thread = LiveThread()
+
+        source = ScapyPacketSource()
+        source._sniffer = FakeSniffer()
+        source._raise_if_capture_died()

@@ -37,6 +37,24 @@ from ebabf.storage import EventStore
 
 __all__ = ["AgentRunner", "SweepResult"]
 
+
+def _with_failures(
+    coverage: CoverageReport | None, failed: list[tuple[str, str]]
+) -> CoverageReport:
+    """Move collectors that failed to start out of `active` and into the gap."""
+    import platform
+
+    names = {name for name, _ in failed}
+    if coverage is None:
+        return CoverageReport(
+            platform=platform.system(), active=(), unavailable=tuple(failed)
+        )
+    return CoverageReport(
+        platform=coverage.platform,
+        active=tuple(n for n in coverage.active if n not in names),
+        unavailable=coverage.unavailable + tuple(failed),
+    )
+
 logger = logging.getLogger(__name__)
 
 
@@ -86,14 +104,41 @@ class AgentRunner:
         return tuple(c.name for c in self._collectors)
 
     def start(self) -> None:
-        """Start the streaming collectors. Idempotent."""
+        """Start the streaming collectors, and declare any that would not run.
+
+        A collector that fails to start is removed from the sweep and moved
+        into the coverage report. Logging it and leaving it in the active list
+        would leave the report claiming a surface that produces nothing -
+        decision 11 requires the gap to be declared, not merely logged.
+
+        Also records how long recording was stopped before this start, so a
+        reboot leaves a mark in the data rather than an unexplained hole.
+        """
         if self._started:
             return
+
+        failed: list[tuple[str, str]] = []
+        running: list[Collector] = []
         for collector in self._collectors:
             try:
                 collector.start()
-            except Exception:  # noqa: BLE001 - one surface down, not the agent
+                running.append(collector)
+            except Exception as exc:  # noqa: BLE001 - one surface down, not the agent
                 logger.exception("collector %s failed to start", collector.name)
+                failed.append((collector.name, f"{type(exc).__name__}: {exc}"))
+
+        if failed:
+            self._collectors = running
+            self._coverage = _with_failures(self._coverage, failed)
+            logger.warning(
+                "coverage gap: %d collector(s) could not start: %s", len(failed), failed
+            )
+
+        try:
+            self._store.detect_downtime()
+        except Exception:  # noqa: BLE001 - a missing mark must not stop recording
+            logger.exception("could not check for a coverage gap before this start")
+
         self._started = True
 
     def close(self) -> None:

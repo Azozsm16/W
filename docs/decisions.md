@@ -324,3 +324,76 @@ used for the Break-Glass severity gate (D-009).
 **Named for overflow, not retention.** Spec 11.2's three-tier retention policy
 is a different mechanism arriving in Sprint 7. Sharing a name would let one
 hide behind the other.
+
+---
+
+## D-020 — Three silent failures closed before the baseline runs
+
+All three were declared as debts and accepted as such. That was wrong: each is
+an *undeclared coverage gap*, which decision 11 forbids outright. A 7-14 day
+recording that dies quietly is worse than one that never started, because the
+dataset still looks complete when a model is trained on it, and the fault is
+then diagnosed as a model problem in Sprint 5.
+
+### The unit (`ebabf-agent unit`)
+
+Two findings from checking this systemd rather than recalling it:
+
+- **`Restart=always` alone does not keep a service alive.** The default start
+  rate limit is five starts in ten seconds (`DefaultStartLimitBurst=5`,
+  `DefaultStartLimitIntervalSec=10s` in system.conf); past it the unit enters
+  `failed` and is never restarted. A crash loop would end the recording
+  permanently while appearing protected. `StartLimitIntervalSec=0` in `[Unit]`
+  removes the limit - the same thing `/lib/systemd/system/modprobe@.service`
+  does.
+- **A misspelled directive is ignored, not rejected.** `systemd-analyze verify`
+  reports `Restrt=always` as "Unknown key name ... ignoring"; the unit starts
+  with no restart policy. `ProtectHome=banana` is likewise "Failed to parse ...
+  ignoring". Generated units are therefore validated by systemd's own parser
+  before install, and an invalid one is refused rather than written.
+
+`RestartPreventExitStatus=78` stops systemd restarting into a disk that is
+still full; the reason is already in `coverage_gaps`.
+
+**No sandboxing directives are emitted.** The agent reads /home for the file
+monitor and /var/log for authentication. `ProtectHome=` or `ProtectSystem=`
+getting either wrong would blind a collector silently, and their runtime effect
+could not be verified here (systemd is not PID 1 in this environment, and the
+upstream documentation is unreachable). Shipping hardening whose effect is
+unverified would add a silent failure while removing three.
+
+### The status command (`ebabf-agent status`)
+
+Prints what was actually recorded, not what was attempted: event count, first
+and last timestamps, wall-clock span, **span after subtracting gaps**, every
+break over ten minutes with its timestamps, outages the agent recorded about
+itself, events dropped to overflow, and free disk.
+
+Gaps are computed from the data with a `LAG()` window function, so it finds
+outages nobody recorded - a `kill -9`, a power cut, an agent that never came
+back after a reboot. The gap threshold is one constant shared with downtime
+detection, so the two can never disagree about what counts as a gap.
+
+### The disk floor
+
+Recording stops with `min_free_bytes` (default 512 MB) still free, writes a
+`storage_halted` row, logs at CRITICAL, and raises `StorageHalted`. The danger
+was never a full disk; it was a disk filling quietly and leaving an unmarked
+hole.
+
+### Two more found while building these
+
+- **The network collector reported itself healthy while capturing nothing.**
+  `libpcap` is absent here, so the BPF filter cannot compile - and scapy raises
+  that inside the capture thread, where nobody listens. `AsyncSniffer.start()`
+  returned cleanly, `sniffer.running` stayed **True**, and the capture thread
+  was already dead. `is_available()` now compiles the filter up front, and
+  `start()` checks thread liveness and the stored exception, since `running`
+  lies.
+- **The file monitor watched roots it could not read.** A root that is missing,
+  unreadable or refused by the kernel emits exactly what a quiet root emits.
+  Unwatchable roots are now listed on the collector and logged as a gap.
+
+A collector that fails to start is also moved out of `CoverageReport.active`
+rather than merely logged, so the report can no longer claim a surface that
+produces nothing.

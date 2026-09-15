@@ -377,3 +377,87 @@ class TestOnlyMutationsAreCounted:
         event = next(iter(collector.collect()))
         assert event.raw_attributes["file_modification_rate"] == pytest.approx(1.0)
         assert event.raw_attributes["ignored_events"] == 500
+
+
+class TestBlindRootsAreDeclared:
+    """A root that cannot be watched produces the same silence as a quiet one.
+
+    Without this list, a sandbox or a permission change that hid /home would
+    read as an uneventful fortnight.
+    """
+
+    def test_a_missing_root_is_declared(
+        self, collector_context: CollectorContext, tmp_path: Path
+    ) -> None:
+        collector = FileMonitorCollector(
+            collector_context,
+            roots=(WatchRoot(tmp_path / "absent", "gone", "alice"),),
+        )
+        collector.start()
+        try:
+            assert collector.watched_root_count == 0
+            assert collector.unwatchable_roots[0][0] == "gone"
+            assert "does not exist" in collector.unwatchable_roots[0][1]
+        finally:
+            collector.close()
+
+    def test_a_file_where_a_directory_was_expected(
+        self, collector_context: CollectorContext, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "not-a-dir"
+        target.write_text("x")
+        collector = FileMonitorCollector(
+            collector_context, roots=(WatchRoot(target, "wrong", "alice"),)
+        )
+        collector.start()
+        try:
+            assert "not a directory" in collector.unwatchable_roots[0][1]
+        finally:
+            collector.close()
+
+    def test_watchable_roots_are_not_listed(
+        self, collector_context: CollectorContext, tmp_path: Path
+    ) -> None:
+        good = tmp_path / "Documents"
+        good.mkdir()
+        collector = FileMonitorCollector(
+            collector_context, roots=(WatchRoot(good, "docs", "alice"),)
+        )
+        collector.start()
+        try:
+            assert collector.unwatchable_roots == ()
+            assert collector.watched_root_count == 1
+        finally:
+            collector.close()
+
+    def test_a_mix_is_reported_precisely(
+        self, collector_context: CollectorContext, tmp_path: Path
+    ) -> None:
+        good = tmp_path / "ok"
+        good.mkdir()
+        collector = FileMonitorCollector(
+            collector_context,
+            roots=(
+                WatchRoot(good, "ok", "alice"),
+                WatchRoot(tmp_path / "absent", "gone", "alice"),
+            ),
+        )
+        collector.start()
+        try:
+            assert collector.watched_root_count == 1
+            assert [label for label, _ in collector.unwatchable_roots] == ["gone"]
+        finally:
+            collector.close()
+
+    def test_the_gap_is_logged(
+        self, collector_context: CollectorContext, tmp_path: Path, caplog
+    ) -> None:
+        import logging
+
+        collector = FileMonitorCollector(
+            collector_context, roots=(WatchRoot(tmp_path / "absent", "gone", "alice"),)
+        )
+        with caplog.at_level(logging.WARNING, logger="ebabf.collectors.filesystem"):
+            collector.start()
+        collector.close()
+        assert any("file coverage gap" in r.message for r in caplog.records)

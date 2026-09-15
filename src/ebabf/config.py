@@ -13,7 +13,7 @@ import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ebabf.storage.event_store import DEFAULT_MAX_EVENTS
+from ebabf.storage.event_store import DEFAULT_MAX_EVENTS, DEFAULT_MIN_FREE_BYTES
 
 __all__ = ["AgentConfig", "DEFAULT_TENANT_ID"]
 
@@ -50,6 +50,11 @@ class AgentConfig:
     # a deliberate choice for a machine with the disk to spare - an unbounded
     # store that fills the disk stops recording silently.
     max_stored_events: int = DEFAULT_MAX_EVENTS
+
+    # Stop recording with this much room left rather than filling the disk
+    # (spec 11.3). A disk that fills quietly leaves an unmarked hole in the
+    # baseline; stopping on purpose puts the reason on the record. 0 disables.
+    min_free_bytes: int = DEFAULT_MIN_FREE_BYTES
 
     # The single setting that turns enforcement off entirely (spec 4, 14.2).
     # Training Mode (spec 17.1) is this set to False.

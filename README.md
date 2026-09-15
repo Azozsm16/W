@@ -40,7 +40,35 @@ Sprints 3-9 are not started. Declared gaps:
 ebabf-agent coverage              # which collectors can run on this host
 ebabf-agent run --interval 30     # sweep every 30s
 ebabf-agent baseline --db baseline.db   # record a clean Benign Baseline (spec 10.1)
+ebabf-agent status --db baseline.db     # what was actually recorded, and any gaps
+ebabf-agent unit --mode baseline        # a systemd unit, validated before it is printed
 ```
+
+### Recording a baseline that survives a fortnight
+
+A 7-14 day recording must not stop quietly. Install it as a service:
+
+```bash
+ebabf-agent unit --mode baseline --db /var/lib/ebabf/baseline.db | \
+  sudo tee /etc/systemd/system/ebabf-baseline.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now ebabf-baseline
+```
+
+Then check it daily. `status` reports the hours actually covered, not the hours
+elapsed:
+
+```
+span            13.46 h wall clock
+covered         7.45 h after removing gaps
+gaps            1 over 10 minutes, 6.01 h lost
+dropped         184  <-- the data has a hole
+```
+
+The agent records an outage whenever it starts after being down, stops writing
+with 512 MB of disk still free rather than filling it, and drops the oldest
+low-severity events past the row cap - each of these leaves a record, so a
+truncated recording cannot pass for a complete one.
 
 Packet capture needs `CAP_NET_RAW`; without it the network collector reports
 itself unavailable and the gap is named in the coverage report rather than

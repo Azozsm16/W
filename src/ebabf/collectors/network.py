@@ -39,6 +39,7 @@ from ebabf.schema import Event, EventSource
 
 __all__ = [
     "NetworkCollector",
+    "CaptureUnavailable",
     "FlowTable",
     "FlowKey",
     "PacketSource",
@@ -56,6 +57,21 @@ HOST_SUBJECT = "__host__"
 
 # How many flow start times to keep per destination for the beaconing measure.
 _MAX_INTERVAL_SAMPLES = 64
+
+# Long enough for a capture thread that cannot start to have died. Without
+# this pause `start()` returns before the failure has happened.
+_START_SETTLE_SECONDS = 0.5
+
+
+class CaptureUnavailable(RuntimeError):
+    """Packet capture could not be started, or died immediately after starting.
+
+    Raised rather than left to be discovered by the absence of traffic. scapy
+    is unhelpful here: AsyncSniffer.start() returns cleanly even when the BPF
+    filter cannot be compiled, and `sniffer.running` stays True while the
+    capture thread is already dead. Only the thread's liveness and its stored
+    exception tell the truth, so both are checked.
+    """
 
 
 def shannon_entropy(text: str) -> float:
@@ -289,11 +305,26 @@ class ScapyPacketSource(PacketSource):
         self._sniffer: Any = None
 
     @classmethod
-    def is_available(cls) -> tuple[bool, str]:
+    def is_available(cls, *, bpf_filter: str | None = "ip or ip6") -> tuple[bool, str]:
+        """Whether capture can actually run here, and why not if it cannot."""
         import os
 
         if not sys.platform.startswith("linux"):
             return False, f"packet capture not implemented for {sys.platform}"
+
+        # A BPF filter is compiled by libpcap. Without it scapy raises inside
+        # the capture thread, where nobody is listening, so it is checked here
+        # instead - before the collector is reported as active.
+        if bpf_filter:
+            try:
+                from scapy.arch.common import compile_filter
+
+                compile_filter(bpf_filter, "lo")
+            except ImportError as exc:
+                return False, f"libpcap is missing, so no BPF filter can be compiled: {exc}"
+            except Exception as exc:  # noqa: BLE001 - any compile failure is unavailability
+                return False, f"BPF filter {bpf_filter!r} will not compile: {exc}"
+
         if os.geteuid() == 0:
             return True, ""
         try:
@@ -317,6 +348,27 @@ class ScapyPacketSource(PacketSource):
             store=False,  # never retain frames: counters only, no packet log
         )
         self._sniffer.start()
+        time.sleep(_START_SETTLE_SECONDS)
+        self._raise_if_capture_died()
+
+    def _raise_if_capture_died(self) -> None:
+        """Turn a dead capture thread into an error the caller can see."""
+        sniffer = self._sniffer
+        if sniffer is None:  # pragma: no cover - start() always sets it
+            raise CaptureUnavailable("capture was never started")
+
+        stored = getattr(sniffer, "exception", None)
+        if stored is not None:
+            raise CaptureUnavailable(f"capture failed to start: {stored}") from stored
+
+        thread = getattr(sniffer, "thread", None)
+        if thread is not None and not thread.is_alive():
+            # `sniffer.running` is still True at this point, which is why it is
+            # not the thing being checked.
+            raise CaptureUnavailable(
+                "the capture thread stopped immediately after starting; "
+                "no packets will be seen"
+            )
 
     def stop(self) -> None:
         if self._sniffer is not None:
@@ -391,6 +443,11 @@ class NetworkCollector(Collector):
         if not available:
             logger.warning("network collector unavailable: %s", reason)
         return available
+
+    @property
+    def is_capturing(self) -> bool:
+        """Whether the capture is genuinely running, not merely started."""
+        return self._started
 
     def start(self) -> None:
         if not self._started:

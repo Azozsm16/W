@@ -220,6 +220,7 @@ class FileMonitorCollector(Collector):
         self._observer: Any = None
         self._last_sweep: float | None = None
         self._watch_count = 0
+        self._unwatchable: list[tuple[str, str]] = []
 
     @classmethod
     def is_supported(cls) -> bool:
@@ -231,14 +232,25 @@ class FileMonitorCollector(Collector):
     # -- lifecycle ----------------------------------------------------------
 
     def start(self) -> None:
+        """Begin watching, and record every root that could not be watched.
+
+        A root that is missing, unreadable or refused by the kernel produces
+        no events - identical output to a root where nothing happened. Without
+        this list the two are indistinguishable, and a sandbox that hid /home
+        would read as a quiet fortnight. Decision 11: a coverage gap is
+        declared, always.
+        """
         if self._observer is not None:
             return
         from watchdog.observers import Observer
 
         self._observer = Observer()
+        self._unwatchable = []
         for root in self._roots:
-            if not root.path.exists():
-                logger.info("watch root %s does not exist; skipped", root.path)
+            reason = _why_unwatchable(root.path)
+            if reason is not None:
+                self._unwatchable.append((root.label, reason))
+                logger.warning("not watching %s: %s", root.path, reason)
                 continue
             handler = self._handlers[root.label]
             try:
@@ -247,10 +259,28 @@ class FileMonitorCollector(Collector):
             except OSError as exc:
                 # Hitting the watch limit is a coverage gap, and coverage gaps
                 # are declared (spec 11.3), never swallowed.
+                self._unwatchable.append((root.label, f"{type(exc).__name__}: {exc}"))
                 logger.error("cannot watch %s: %s", root.path, exc)
+
+        if self._unwatchable:
+            logger.warning(
+                "file coverage gap: %d of %d roots are not being watched: %s",
+                len(self._unwatchable),
+                len(self._roots),
+                self._unwatchable,
+            )
         self._warn_if_near_watch_limit()
         self._observer.start()
         self._last_sweep = time.time()
+
+    @property
+    def unwatchable_roots(self) -> tuple[tuple[str, str], ...]:
+        """(label, why) for every root this collector is blind to."""
+        return tuple(self._unwatchable)
+
+    @property
+    def watched_root_count(self) -> int:
+        return len(self._roots) - len(self._unwatchable)
 
     def close(self) -> None:
         if self._observer is None:
@@ -322,6 +352,26 @@ class FileMonitorCollector(Collector):
     @property
     def watch_count(self) -> int:
         return self._watch_count
+
+
+def _why_unwatchable(path: Path) -> str | None:
+    """Why `path` cannot be watched, or None if it can.
+
+    Checked before scheduling rather than after, because watchdog reports a
+    root it cannot read the same way it reports one where nothing happened:
+    with silence.
+    """
+    if not path.exists():
+        return "does not exist"
+    if not path.is_dir():
+        return "not a directory"
+    if not os.access(path, os.R_OK | os.X_OK):
+        return "not readable by this process (permissions, or a sandbox)"
+    try:
+        os.listdir(path)
+    except OSError as exc:
+        return f"cannot be listed: {type(exc).__name__}: {exc}"
+    return None
 
 
 def read_inotify_limit() -> int | None:

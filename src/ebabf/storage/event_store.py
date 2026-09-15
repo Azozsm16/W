@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -31,7 +32,13 @@ from ebabf.schema import (
     RiskLevel,
 )
 
-__all__ = ["EventStore", "DEFAULT_MAX_EVENTS"]
+__all__ = [
+    "EventStore",
+    "StorageHalted",
+    "DEFAULT_MAX_EVENTS",
+    "DEFAULT_MIN_FREE_BYTES",
+    "DEFAULT_GAP_THRESHOLD_SECONDS",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +49,29 @@ DEFAULT_MAX_EVENTS = 2_000_000
 # Once over the cap, evict down to this share of it rather than one row per
 # append: a delete on every insert would thrash the table for no benefit.
 _EVICT_TO_RATIO = 0.95
+
+# Stop writing with this much room left, rather than discovering the ceiling
+# by failing mid-write. Enough to record why we stopped and leave the host
+# usable.
+DEFAULT_MIN_FREE_BYTES = 512 * 1024 * 1024
+
+# A break longer than this is the agent having been down, not a quiet host.
+# Used both to detect downtime at startup and to report gaps in `status`, so
+# the two can never disagree about what counts as a gap.
+DEFAULT_GAP_THRESHOLD_SECONDS = 600.0
+
+# statvfs is cheap but not free; at ~420 bytes an event this bounds the
+# overshoot past the floor to well under a megabyte.
+_FREE_SPACE_CHECK_EVERY = 500
+
+
+class StorageHalted(RuntimeError):
+    """Recording was stopped deliberately, and the reason is on the record.
+
+    Raised instead of writing into a nearly full disk. Stopping on purpose and
+    saying so beats being killed mid-write: a half-written database is a
+    corrupt one, and a baseline that stopped silently still looks complete.
+    """
 
 # Built from the same constants the Python property uses, so SQL and Python
 # cannot drift apart into two different definitions of "verdict".
@@ -126,6 +156,19 @@ CREATE INDEX IF NOT EXISTS idx_events_level    ON events(level);
 -- retention: spec 11.2's three-tier retention policy is a different mechanism
 -- and arrives in Sprint 7. Conflating the two names would hide one behind the
 -- other.
+-- Periods where the agent recorded nothing, and why. Decision 11: a coverage
+-- gap is always declared. systemd restarting the agent closes the outage; it
+-- does not close the hole in the data, and only this table shows the hole.
+CREATE TABLE IF NOT EXISTS coverage_gaps (
+    gap_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    detected_at      TEXT NOT NULL,
+    kind             TEXT NOT NULL,
+    gap_start        TEXT,
+    gap_end          TEXT,
+    duration_seconds REAL,
+    detail           TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS overflow_drops (
     drop_id            INTEGER PRIMARY KEY AUTOINCREMENT,
     dropped_at         TEXT NOT NULL,
@@ -175,6 +218,7 @@ class EventStore:
         *,
         clock: Callable[[], datetime] = _utc_now,
         max_events: int | None = None,
+        min_free_bytes: int | None = None,
     ) -> None:
         self._path = Path(db_path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -197,6 +241,14 @@ class EventStore:
         self._row_count = int(
             self._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         )
+
+        self._min_free_bytes = min_free_bytes if min_free_bytes else None
+        self._appends_since_space_check = _FREE_SPACE_CHECK_EVERY
+        self._halted_reason: str | None = None
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     def close(self) -> None:
         with self._lock:
@@ -246,10 +298,191 @@ class EventStore:
             self._conn.execute(
                 f"INSERT INTO events ({', '.join(_COLUMNS)}) VALUES ({placeholders})", values
             )
+            self._check_free_space_locked()
             self._row_count += 1
             if self._max_events is not None and self._row_count > self._max_events:
                 self._evict_locked()
         return stamped
+
+    # -- free space (decision 11: a coverage gap is always declared) --------
+
+    @property
+    def is_halted(self) -> bool:
+        return self._halted_reason is not None
+
+    @property
+    def halted_reason(self) -> str | None:
+        return self._halted_reason
+
+    def free_bytes(self) -> int:
+        """Space left on the filesystem holding the database."""
+        return shutil.disk_usage(self._path.parent).free
+
+    def _check_free_space_locked(self) -> None:
+        """Refuse to write into a nearly full disk. Caller holds the lock.
+
+        The danger is not a full disk; it is a disk that fills quietly and
+        leaves a baseline with an unmarked hole in it. So recording stops on
+        purpose, the reason goes on the record, and the caller is told.
+        """
+        if self._halted_reason is not None:
+            raise StorageHalted(self._halted_reason)
+        if self._min_free_bytes is None:
+            return
+
+        self._appends_since_space_check += 1
+        if self._appends_since_space_check < _FREE_SPACE_CHECK_EVERY:
+            return
+        self._appends_since_space_check = 0
+
+        try:
+            free = shutil.disk_usage(self._path.parent).free
+        except OSError as exc:  # pragma: no cover - unreadable mount point
+            logger.warning("cannot read free space for %s: %s", self._path.parent, exc)
+            return
+        if free >= self._min_free_bytes:
+            return
+
+        reason = (
+            f"free space {free / 1e6:.0f} MB fell below the "
+            f"{self._min_free_bytes / 1e6:.0f} MB floor"
+        )
+        self._halted_reason = reason
+        self._record_gap_locked(
+            kind="storage_halted",
+            gap_start=self._clock().isoformat(),
+            gap_end=None,
+            duration_seconds=None,
+            detail=reason,
+        )
+        logger.critical(
+            "RECORDING HALTED: %s. Nothing further is being captured. "
+            "Free space and restart the agent.",
+            reason,
+        )
+        raise StorageHalted(reason)
+
+    # -- coverage gaps ------------------------------------------------------
+
+    def _record_gap_locked(
+        self,
+        *,
+        kind: str,
+        gap_start: str | None,
+        gap_end: str | None,
+        duration_seconds: float | None,
+        detail: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO coverage_gaps (detected_at, kind, gap_start, gap_end, "
+            "duration_seconds, detail) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                self._clock().isoformat(),
+                kind,
+                gap_start,
+                gap_end,
+                duration_seconds,
+                detail,
+            ),
+        )
+
+    def detect_downtime(self, threshold_seconds: float = DEFAULT_GAP_THRESHOLD_SECONDS) -> float | None:
+        """Record the outage since the last event, if there was one.
+
+        Called when recording starts. systemd bringing the agent back closes
+        the outage but not the hole it left; without this the hole is invisible
+        and the operator believes the run was continuous.
+
+        Returns the gap in seconds, or None if there was no meaningful one.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(ingested_at) FROM events"
+            ).fetchone()
+            last = row[0] if row else None
+            if last is None:
+                return None
+
+            now = self._clock()
+            gap = (now - datetime.fromisoformat(last)).total_seconds()
+            if gap < threshold_seconds:
+                return None
+
+            self._record_gap_locked(
+                kind="agent_downtime",
+                gap_start=last,
+                gap_end=now.isoformat(),
+                duration_seconds=gap,
+                detail=(
+                    f"no events recorded for {gap / 3600:.1f} hours before this start"
+                ),
+            )
+        logger.warning(
+            "coverage gap: nothing was recorded for %.1f hours before this start "
+            "(%s to %s). The data has a hole in it.",
+            gap / 3600,
+            last,
+            now.isoformat(),
+        )
+        return gap
+
+    def find_gaps(
+        self, min_seconds: float = DEFAULT_GAP_THRESHOLD_SECONDS
+    ) -> list[dict[str, Any]]:
+        """Breaks between consecutive events longer than `min_seconds`.
+
+        Computed from the data itself, so it finds outages nobody recorded -
+        a kill -9, a power cut, an agent that never started after a reboot.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT prev_at, ingested_at, gap FROM ("
+                "  SELECT ingested_at, LAG(ingested_at) OVER (ORDER BY ingested_at) AS prev_at,"
+                "         (julianday(ingested_at) - LAG(julianday(ingested_at)) "
+                "          OVER (ORDER BY ingested_at)) * 86400.0 AS gap"
+                "  FROM events"
+                ") WHERE prev_at IS NOT NULL AND gap > ? ORDER BY gap DESC",
+                (min_seconds,),
+            ).fetchall()
+        return [
+            {"start": start, "end": end, "duration_seconds": round(gap, 1)}
+            for start, end, gap in rows
+        ]
+
+    def coverage_gap_log(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Gaps the agent recorded about itself, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT gap_id, detected_at, kind, gap_start, gap_end, duration_seconds, "
+                "detail FROM coverage_gaps ORDER BY gap_id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        keys = (
+            "gap_id",
+            "detected_at",
+            "kind",
+            "gap_start",
+            "gap_end",
+            "duration_seconds",
+            "detail",
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
+    def span(self) -> dict[str, Any]:
+        """First and last ingestion times, and the wall-clock hours between."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MIN(ingested_at), MAX(ingested_at), COUNT(*) FROM events"
+            ).fetchone()
+        first, last, count = row
+        hours = None
+        if first and last:
+            hours = round(
+                (datetime.fromisoformat(last) - datetime.fromisoformat(first)).total_seconds()
+                / 3600,
+                2,
+            )
+        return {"first": first, "last": last, "count": int(count), "span_hours": hours}
 
     # -- overflow (spec 11.3) ----------------------------------------------
 

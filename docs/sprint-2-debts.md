@@ -62,24 +62,23 @@ path ownership (D-013). A file written under `/home/alice` by a compromised
 service running as root is attributed to alice. fanotify or auditd would fix
 this and are out of scope for v1.
 
-## Baseline recording: two gaps left open deliberately
+## Baseline recording
 
-`ebabf-agent baseline --db baseline.db` runs the agent with enforcement off and
-writes to a separate database. Storage is now bounded and every drop is
-recorded (D-019), which was the gap that could corrupt a run silently. Two
-remain, both of which fail loudly rather than quietly:
+Closed in D-020: a validated systemd unit with `Restart=always` and the start
+rate limit removed, an `ebabf-agent status` command that reports covered hours
+and every gap over ten minutes, and a disk floor that stops recording on
+purpose rather than filling the disk.
 
-- **No progress report.** There is no way to see how many days have elapsed or
-  how many events were gathered without opening the database. A run can be
-  inspected with `EventStore.count()` and `dropped_event_count()`; nothing
-  presents it.
-- **No resume across reboots.** Restarting the machine stops the recording and
-  nothing brings it back - there is no systemd unit. The operator has to
-  notice and restart it.
+Still open, and a procedure rather than code: nothing verifies the host was
+clean before recording starts (spec 15, Baseline Poisoning). That belongs to
+whoever owns the machine.
 
-Also still open: nothing verifies the host was clean before recording starts
-(spec 15, Baseline Poisoning). That verification is a procedure, not code, and
-belongs with whoever owns the machine.
+## Superseded: the two gaps that were left open
+
+Both were closed in D-020 rather than carried. They were described here as
+failing loudly; they did not. A reboot stopped recording with no notification,
+and the resulting hole was invisible. Calling an undeclared coverage gap an
+acceptable debt contradicted decision 11.
 
 ## Storage is bounded by rows, not by bytes
 

@@ -300,3 +300,76 @@ class TestNamingDiscipline:
 
         with pytest.raises(SystemExit):
             main(["--help"])
+
+
+class TestStartFailuresBecomeCoverageGaps:
+    """A collector that will not start must leave the active list.
+
+    Logging it and leaving it listed would have the coverage report claim a
+    surface that produces nothing - the gap that this project keeps finding.
+    """
+
+    def _runner_with_bad_start(self, collector_context, event_store, kill_switch):
+        from ebabf.collectors.registry import CoverageReport
+
+        class BadStart(StubCollector):
+            name = "bad_start"
+
+            def start(self) -> None:
+                raise OSError("libpcap missing")
+
+        collectors = [BadStart(collector_context), SecondCollector(collector_context, count=2)]
+        runner = AgentRunner(
+            collectors=collectors,
+            decision_engine=PassThroughDecisionEngine(),
+            enforcement_engine=NoOpEnforcementEngine(enabled=True, kill_switch=kill_switch),
+            event_store=event_store,
+            coverage=CoverageReport(
+                platform="Linux", active=("bad_start", "second"), unavailable=()
+            ),
+        )
+        return runner
+
+    def test_the_failed_collector_leaves_the_active_list(
+        self, collector_context, event_store: EventStore, kill_switch
+    ) -> None:
+        runner = self._runner_with_bad_start(collector_context, event_store, kill_switch)
+        runner.start()
+        try:
+            assert runner.coverage is not None
+            assert "bad_start" not in runner.coverage.active
+            assert "second" in runner.coverage.active
+            assert runner.coverage.is_complete is False
+            assert runner.coverage.unavailable[0][0] == "bad_start"
+            assert "libpcap" in runner.coverage.unavailable[0][1]
+        finally:
+            runner.close()
+
+    def test_it_is_not_swept_afterwards(
+        self, collector_context, event_store: EventStore, kill_switch
+    ) -> None:
+        runner = self._runner_with_bad_start(collector_context, event_store, kill_switch)
+        runner.start()
+        try:
+            assert runner.collector_names == ("second",)
+            assert runner.sweep_once().collected == 2
+        finally:
+            runner.close()
+
+    def test_healthy_collectors_leave_coverage_complete(
+        self, collector_context, event_store: EventStore, kill_switch
+    ) -> None:
+        from ebabf.collectors.registry import CoverageReport
+
+        runner = AgentRunner(
+            collectors=[StubCollector(collector_context)],
+            decision_engine=PassThroughDecisionEngine(),
+            enforcement_engine=NoOpEnforcementEngine(enabled=True, kill_switch=kill_switch),
+            event_store=event_store,
+            coverage=CoverageReport(platform="Linux", active=("stub",), unavailable=()),
+        )
+        runner.start()
+        try:
+            assert runner.coverage.is_complete is True
+        finally:
+            runner.close()
